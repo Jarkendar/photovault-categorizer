@@ -181,15 +181,97 @@ Document final values here once tuned against real photos.
 
 ---
 
-## Phase 2 — People (planned)
+## Phase 2 — People
 
-Dedicated face detection + recognition pipeline with a **separate** vector store
-(face embeddings live in a different space than CLIP scene embeddings).
+Face detection and identity recognition pipeline with a **separate** face vector store
+(ArcFace embeddings live in a different space than CLIP scene embeddings).
 
-- Face model: InsightFace / ArcFace ONNX (lightweight enough for Pi inference).
-- Separate `faces.hnsw` store keyed by `face-<uuid>` → `photo-<uuid>` + bounding box.
-- Identity clustering: DBSCAN / agglomerative → proposed identity → maps to a `tag-*` or `category-*`.
-- Once labelled: `auto_enabled = true` on the person tag/category; nightly runs assign new matching photos.
+- **Model:** InsightFace **buffalo_l** (SCRFD-10G detector + ArcFace R50 → 512-d L2-norm vector, ONNX, local inference)
+- **Face store:** `{FACE_STORE_DIR}/faces-buffalo_l.npz` keyed by `face-<uuid>`, separate from CLIP store
+- **Face metadata:** `faces` table in PostgreSQL (bbox in `medium.jpg` pixels, `det_score`, `cluster_id`, model)
+- **Labelling:** admin API at `/v1/admin/face-clusters` — consumed by a standalone web/desktop tool, NOT the Android app; requires JWT `role=admin`
+
+### Scripts
+
+#### `detect_faces.py` — bulk face detection backfill ✅
+
+```bash
+python -m photovault_categorizer.cli.detect_faces
+```
+
+Detects faces in all photos that have not yet been processed (or were processed with an older model).
+Run on the PC/RTX for the initial backfill; runs on Pi too but is slower.
+Chunked and resumable — safe to interrupt and restart.
+
+`categorize.py` also runs face detection as part of the nightly pass for new delta photos.
+
+#### `cluster_faces.py` — group unassigned faces into clusters (on-demand PC)
+
+```bash
+python -m photovault_categorizer.cli.cluster_faces
+```
+
+Runs DBSCAN (cosine metric, `eps=0.4`, `min_samples=2`) on face vectors that have no cluster yet.
+Labelled clusters are frozen — only `cluster_id IS NULL` faces are touched.
+Creates `face_clusters` rows in the DB and sets `faces.cluster_id`.
+Noise points (DBSCAN label −1) remain unassigned for the next run.
+
+Run after `detect_faces.py` has populated the face store and before using the admin API to label clusters.
+
+### Face pipeline knobs (tune and document values in `config.py`)
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `FACE_DET_THRESH` | `0.5` | Detector confidence floor — lower = more faces detected (including profiles), higher = fewer false positives |
+| `FACE_MIN_PX` | `40` | Minimum face bounding-box side in pixels — filters out distant/blurry faces |
+| `FACE_MATCH_THRESHOLD` | `0.5` | Cosine similarity floor for nightly identity matching — tune on photos of the same person at different ages and lighting |
+
+DBSCAN `eps=0.4` / `min_samples=2` are set in `cli/cluster_faces.py`. Adjust if clusters are too coarse (increase `eps`) or too fragmented (decrease `eps`).
+
+### CLI smoke test (no app required)
+
+Complete end-to-end Phase 2 verification via SQL and CLI — no Android app or admin web tool needed.
+
+```bash
+# 1. Bulk face detection across the entire library (PC/RTX or Pi)
+python -m photovault_categorizer.cli.detect_faces
+# Verify: SELECT count(*) FROM faces;
+# Verify: SELECT faces_detected_at, face_detection_model FROM photos LIMIT 5;
+
+# 2. Group faces into clusters
+python -m photovault_categorizer.cli.cluster_faces
+# Verify: SELECT id, face_count, representative_face_id FROM face_clusters;
+# Verify: SELECT cluster_id, count(*) FROM faces GROUP BY cluster_id ORDER BY count DESC;
+
+# 3. Inspect a cluster — pick the one that looks like a specific person
+psql $DB_URL -c "
+  SELECT f.id, f.photo_id, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h, f.det_score
+  FROM faces f
+  WHERE f.cluster_id = 'fcluster-<uuid>'
+  ORDER BY f.det_score DESC LIMIT 10;"
+
+# 4a. Label via admin API (once deployed)
+curl -s -X POST http://localhost:8080/v1/admin/face-clusters/fcluster-<uuid>/label \
+  -H "Authorization: Bearer <admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"tagId": "tag-<uuid>"}'
+
+# 4b. Label directly via SQL (bridge before the admin API is deployed)
+psql $DB_URL <<'SQL'
+UPDATE tags SET auto_enabled = true WHERE id = 'tag-<uuid>';
+INSERT INTO photo_tags (photo_id, tag_id, score, source, embedding_run)
+SELECT DISTINCT f.photo_id, 'tag-<uuid>', f.det_score, 'auto', 'manual-label-cli'
+FROM faces f WHERE f.cluster_id = 'fcluster-<uuid>'
+ON CONFLICT (photo_id, tag_id) DO UPDATE
+    SET score = EXCLUDED.score, embedding_run = EXCLUDED.embedding_run
+WHERE photo_tags.source = 'auto';
+SQL
+
+# 5. Upload a new photo of the same person, wait for pending_categorization, then:
+python -m photovault_categorizer.cli.categorize
+# Check log: "faces detected: N, faces matched: M, new unlabeled faces: K"
+# Check DB:  SELECT source, score FROM photo_tags WHERE photo_id = '<new-photo-id>';
+```
 
 ---
 
@@ -222,6 +304,11 @@ All configuration via environment variables. Copy `.env.example` to `.env` and f
 | `TAG_THRESHOLD` | `0.25` | Cosine similarity floor for tag assignment |
 | `CATEGORY_TOP_K` | `1` | Max categories assigned per photo |
 | `CATEGORY_MIN_SCORE` | `0.0` | Minimum score for any category assignment |
+| `FACE_STORE_DIR` | `./data/faces` | Directory for the face vector `.npz` file |
+| `INSIGHTFACE_HOME` | `~/.insightface` | Path where InsightFace looks for model packs (must contain pre-downloaded `buffalo_l`) |
+| `FACE_DET_THRESH` | `0.5` | Detector confidence floor (Phase 2) |
+| `FACE_MIN_PX` | `40` | Minimum face size in pixels (Phase 2) |
+| `FACE_MATCH_THRESHOLD` | `0.5` | Identity matching cosine threshold (Phase 2) |
 
 ---
 

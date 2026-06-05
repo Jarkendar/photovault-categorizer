@@ -47,3 +47,18 @@ def test_scoring_overrides():
     assert c.tag_threshold == pytest.approx(0.35)
     assert c.category_top_k == 2
     assert c.category_min_score == pytest.approx(0.1)
+
+
+def test_face_defaults():
+    c = Config.from_env()
+    assert c.face_det_thresh == pytest.approx(0.5)
+    assert c.face_min_px == 40
+    assert c.face_match_threshold == pytest.approx(0.50)
+
+
+def test_face_overrides():
+    _set_env(FACE_DET_THRESH="0.6", FACE_MIN_PX="60", FACE_MATCH_THRESHOLD="0.55")
+    c = Config.from_env()
+    assert c.face_det_thresh == pytest.approx(0.6)
+    assert c.face_min_px == 60
+    assert c.face_match_threshold == pytest.approx(0.55)

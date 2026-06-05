@@ -13,6 +13,12 @@ dependencies = [
     "Pillow>=10.0.0",
     "numpy>=1.26.0",
     "PyYAML>=6.0.0",
+    # Phase 2 — face pipeline
+    "insightface>=0.7.3",
+    "onnxruntime>=1.16.0",
+    "opencv-python-headless>=4.8.0",
+    # Phase 2 — face clustering (Iter 2)
+    "scikit-learn>=1.4.0",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,15 @@
+[Unit]
+Description=Run PhotoVault auto-categorizer daily at 03:00
+Documentation=https://github.com/Jarkendar/photovault-categorizer
+
+[Timer]
+# Fire at 03:00 local time every day.
+OnCalendar=*-*-* 03:00:00
+# If the system was off at the scheduled time, run once it comes back up.
+Persistent=true
+# Allow up to 5 minutes of random delay so multiple Pi units don't all
+# hammer Postgres at exactly the same second (harmless if you only have one).
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -14,29 +14,7 @@ Runs as `docker run --rm` — nothing stays alive between runs.
 | Iteration | Scope | Status |
 |---|---|---|
 | **1** | Scaffold, nightly `categorize.py`, unit tests | ✅ done |
-| **2** | `bulk_embed.py`, `add_label.py`, self-heal, systemd timer | ☐ planned |
-
-### Iteration 2 — what needs to be built
-
-- **`cli/bulk_embed.py`** — one-shot full-library embed for a large initial backlog.
-  Queries `photos WHERE embedded_at IS NULL OR embedding_model <> ?`, downloads `medium.jpg`,
-  encodes in batches, writes vectors to store, updates `photos.embedded_at` + `embedding_model`.
-  Runs on RTX for speed; same code works on Pi (just slower). Not needed when the library
-  grows organically from zero through the app.
-
-- **`cli/add_label.py <label-id>`** — backfill a single newly created label without
-  re-embedding any photos. Sets `rolled_out = false`, loads the existing `.npz` store,
-  scores every photo vector against the new label's text prototype, writes `source = auto`
-  rows (respects `denied` tombstones), then sets `rolled_out = true`.
-
-- **Self-heal in `categorize.py`** — at the start of each nightly run, check whether any
-  photo in the DB is missing from the `.npz` store (deleted and re-uploaded, or store was
-  reset). Re-embed those photos before scoring. Currently the nightly job only processes
-  the `pending_categorization` delta.
-
-- **`deploy/photovault-categorizer.service`** + **`deploy/photovault-categorizer.timer`** —
-  systemd unit + timer that fires `docker run --rm photovault-categorizer` daily at ~03:00
-  on the Pi. Also document the n8n flow alternative.
+| **2** | `bulk_embed.py`, `add_label.py`, self-heal, systemd timer | ✅ done |
 
 ---
 
@@ -153,7 +131,13 @@ python -m photovault_categorizer.cli.categorize
 5. Prunes orphan vectors (deleted photos) from the store; saves.
 6. Logs: `photos processed: N, tags inserted: M, categories inserted: K, denied skipped: D`.
 
-#### `bulk_embed.py` — optional one-time backfill ☐ (Iteration 2)
+The nightly run also performs a **self-heal pass** before processing the delta queue: any
+photo in `processing_status='ready'` whose vector is absent from the store (e.g. the store
+was reset or the photo was deleted and re-uploaded) is re-embedded and re-scored in the same
+run. Setting `processing_status='ready'` again is idempotent; `assign_auto` still respects
+`manual`/`denied` tombstones.
+
+#### `bulk_embed.py` — one-time full-library backfill ✅
 
 ```bash
 python -m photovault_categorizer.cli.bulk_embed
@@ -161,15 +145,25 @@ python -m photovault_categorizer.cli.bulk_embed
 
 Embeds all photos missing from the vector store or embedded with an older model.
 Use when you have a large existing backlog. Runs on Pi too, just slower (~0.5 s/photo CPU).
+The run is resumable — checkpointed every 256 photos, so interrupting and restarting is safe.
 
-#### `add_label.py` — new-label backfill ☐ (Iteration 2)
+Does **not** score or write junction rows — run `categorize.py` separately to assign labels.
+
+#### `add_label.py` — new-label backfill ✅
 
 ```bash
 python -m photovault_categorizer.cli.add_label <tag-or-category-id>
 ```
 
-Backfills a single newly created label without touching image embeddings:
-re-scores all cached vectors, writes `auto` rows, flips `rolled_out = true`.
+Backfills a single newly created label against **cached** vectors — no re-embedding.
+
+Requirements before running:
+1. The tag/category must exist in the DB with `auto_enabled = true`.
+2. The label name must have an entry in `prompts.yaml`.
+3. For categories: `CATEGORY_MIN_SCORE` must be > 0 (otherwise every photo matches).
+
+The script brackets the backfill pass with `rolled_out = false` → score → `rolled_out = true`.
+`assign_auto` still respects `manual`/`denied` tombstones so no user edits are overwritten.
 
 ### Scoring knobs (to tune)
 
@@ -178,6 +172,10 @@ re-scores all cached vectors, writes `auto` rows, flips `rolled_out = true`.
 | `TAG_THRESHOLD` | `0.25` | Minimum cosine similarity for a tag to be assigned |
 | `CATEGORY_TOP_K` | `1` | Maximum number of categories to assign per photo |
 | `CATEGORY_MIN_SCORE` | `0.0` | Minimum score a category must reach to be assigned |
+
+Note: `CATEGORY_MIN_SCORE=0.0` is safe for the nightly `top-k` ranking (it selects the
+best-scoring category regardless) but **must be set to a positive value** (e.g. `0.20`)
+before using `add_label.py` for categories — otherwise every photo would be assigned.
 
 Document final values here once tuned against real photos.
 
@@ -230,7 +228,7 @@ All configuration via environment variables. Copy `.env.example` to `.env` and f
 ## Running
 
 ```bash
-# Nightly Pi run (Docker)
+# Nightly Pi run (Docker — automated via systemd timer, see deploy/)
 docker run --rm \
   --env-file .env \
   -v /path/to/photos:/photos:ro \
@@ -240,16 +238,19 @@ docker run --rm \
 # Local run for testing (venv, uses CUDA if available)
 python -m photovault_categorizer.cli.categorize
 
-# Iteration 2 — one-time bulk embed
+# One-time bulk embed of an existing library backlog
 docker run --rm --env-file .env \
   -v /path/to/photos:/photos:ro -v /path/to/vectors:/vectors \
   photovault-categorizer python -m photovault_categorizer.cli.bulk_embed
 
-# Iteration 2 — backfill a new label
+# Backfill a newly created label against cached vectors
 docker run --rm --env-file .env \
   -v /path/to/photos:/photos:ro -v /path/to/vectors:/vectors \
   photovault-categorizer python -m photovault_categorizer.cli.add_label tag-<uuid>
 ```
+
+For automated deployment on the Pi (systemd timer firing daily at 03:00), see
+[`deploy/README.md`](deploy/README.md).
 
 ### Local development setup
 
@@ -260,10 +261,10 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 
 # Unit tests (no DB required)
-.venv/bin/pytest tests/ --ignore=tests/test_write_precedence.py
+.venv/bin/pytest tests/
 
-# Integration tests (requires running Postgres matching DB_URL)
-.venv/bin/pytest tests/test_write_precedence.py
+# Integration tests only (requires running Postgres matching DB_URL; auto-skipped otherwise)
+.venv/bin/pytest tests/test_write_precedence.py tests/test_db_iter2.py
 ```
 
 ---

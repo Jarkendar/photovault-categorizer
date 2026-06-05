@@ -5,15 +5,18 @@ Algorithm:
   1. Acquire an exclusive file lock; exit 0 immediately if already locked
      (prevents two simultaneous runs from corrupting the vector store).
   2. Fetch the delta queue: photos with processing_status='pending_categorization'.
-  3. Load MobileCLIP-S2, the vector store, and CLIP text prototypes for every
+  3. Self-heal pass: photos in 'ready' status whose vector is missing from the
+     store (e.g. store was reset, or the photo was deleted and re-uploaded).
+     These are appended to the work list and processed identically to new photos.
+  4. Load MobileCLIP-S2, the vector store, and CLIP text prototypes for every
      auto-enabled+rolled-out tag/category that has a prompts.yaml entry.
-  4. For each photo in the delta:
+  5. For each photo in the combined queue:
        a. Embed medium.jpg → upsert vector into store.
        b. Score against all tag/category prototypes.
        c. In one transaction: insert/update auto-assignment rows + flip
           processing_status to 'ready' + update embedded_at/embedding_model.
-  5. Prune orphan vectors (deleted photos) from the store and save.
-  6. Log a one-line summary.
+  6. Prune orphan vectors (deleted photos) from the store and save.
+  7. Log a one-line summary.
 
 Usage:
     python -m photovault_categorizer.cli.categorize
@@ -21,7 +24,6 @@ Usage:
 All configuration via environment variables — see .env.example.
 """
 
-import fcntl
 import logging
 import sys
 from datetime import datetime, timezone
@@ -32,9 +34,11 @@ from ..db import (
     fetch_all_photo_ids,
     fetch_auto_enabled_labels,
     fetch_delta_queue,
+    fetch_ready_with_medium,
     get_connection,
 )
 from ..embed import embed_photos
+from ..lock import with_lock
 from ..model import load_model
 from ..prompts import build_prototypes, load_prompts
 from ..scoring import score_photo
@@ -43,7 +47,13 @@ from ..write import assign_auto
 
 log = logging.getLogger(__name__)
 
-LOCK_PATH = "/tmp/photovault-categorize.lock"
+
+def missing_from_store(
+    rows: list[tuple[str, str]],
+    store: VectorStore,
+) -> list[tuple[str, str]]:
+    """Return only those (photo_id, medium_path) pairs whose vector is absent from *store*."""
+    return [(pid, path) for pid, path in rows if pid not in store]
 
 
 def main() -> None:
@@ -52,19 +62,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    lock_file = open(LOCK_PATH, "w")  # noqa: WPS515
-    try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        log.info("Another categorize run is active (lock held at %s) — exiting 0", LOCK_PATH)
-        lock_file.close()
-        sys.exit(0)
-
-    try:
+    with with_lock():
         _run()
-    finally:
-        fcntl.flock(lock_file, fcntl.LOCK_UN)
-        lock_file.close()
 
 
 def _run() -> None:
@@ -72,26 +71,36 @@ def _run() -> None:
 
     with get_connection(config) as conn:
         delta = fetch_delta_queue(conn)
+        ready_rows = fetch_ready_with_medium(conn)
         labels = fetch_auto_enabled_labels(conn)
 
-    if not delta:
-        log.info("No photos pending categorization — nothing to do")
+    # Load vector store before self-heal check (we need it to detect missing vectors).
+    store_path = Path(config.vector_store_dir) / f"{MODEL_ID}.npz"
+    store = VectorStore(store_path)
+    store.load()
+    log.info("Vector store: %d existing vectors at %s", len(store), store_path)
+
+    # Self-heal: ready photos whose vector disappeared from the store.
+    heal_rows = missing_from_store(ready_rows, store)
+    if heal_rows:
+        log.info("Self-heal: %d ready photo(s) missing from store — will re-embed", len(heal_rows))
+
+    work_queue = delta + heal_rows
+
+    if not work_queue:
+        log.info("No photos pending categorization and no self-heal needed — nothing to do")
         return
 
     log.info(
-        "Delta queue: %d photo(s) | auto-enabled labels: %d",
+        "Work queue: %d photo(s) (%d delta, %d self-heal) | auto-enabled labels: %d",
+        len(work_queue),
         len(delta),
+        len(heal_rows),
         len(labels),
     )
 
     # Load model (CUDA on PC/RTX, CPU on Pi — same code path)
     model, preprocess, tokenizer, device = load_model()
-
-    # Load vector store (creates a fresh one if the .npz does not exist yet)
-    store_path = Path(config.vector_store_dir) / f"{MODEL_ID}.npz"
-    store = VectorStore(store_path)
-    store.load()
-    log.info("Vector store: %d existing vectors at %s", len(store), store_path)
 
     # Build text prototypes once per run (cheap: only text encoding, no image I/O)
     prompts_map = load_prompts(config.prompts_path)
@@ -110,7 +119,7 @@ def _run() -> None:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"/{MODEL_ID}"
 
     with get_connection(config) as conn:
-        for photo_id, medium_path in delta:
+        for photo_id, medium_path in work_queue:
             try:
                 tags_inserted, cats_inserted, denied_skipped, ok = _process_photo(
                     conn=conn,

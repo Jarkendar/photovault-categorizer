@@ -1,0 +1,25 @@
+[Unit]
+Description=PhotoVault auto-categorizer (oneshot CLIP job)
+Documentation=https://github.com/Jarkendar/photovault-categorizer
+# Start only after the network is up so Tailscale can reach Postgres.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust paths to match your Pi's actual mount points.
+# /etc/photovault/categorizer.env must contain at minimum:
+#   DB_URL, DB_USER, DB_PASSWORD
+# (PHOTO_STORAGE_ROOT and VECTOR_STORE_DIR are set via volume paths below
+#  unless you override them in the env file.)
+EnvironmentFile=/etc/photovault/categorizer.env
+ExecStart=/usr/bin/docker run --rm \
+    --env-file /etc/photovault/categorizer.env \
+    -v /srv/photovault/photos:/photos:ro \
+    -v /srv/photovault/vectors:/vectors \
+    photovault-categorizer
+# Do not report failure when the lock is held by a concurrent run (exit 0).
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

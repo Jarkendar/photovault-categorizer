@@ -309,6 +309,74 @@ def fetch_labelled_cluster_faces(conn: psycopg.Connection) -> list[tuple[str, st
     return results
 
 
+# ── Phase 3 — event detection helpers ────────────────────────────────────────
+
+_EVENT_COLORS = [
+    "#1E88E5", "#43A047", "#FB8C00", "#8E24AA",
+    "#E53935", "#00ACC1", "#F4511E", "#6D4C41",
+]
+
+
+def fetch_photos_with_location(conn: psycopg.Connection) -> list:
+    """Returns PhotoRecord objects for photos with captured_at set (GPS may be null).
+
+    Includes photos without GPS so temporal clusters are complete. GPS data is used
+    only inside passes_heuristic to verify the cluster is away from home.
+    """
+    from .event_clustering import PhotoRecord
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, captured_at, lat, lng, place_name"
+            " FROM photos"
+            " WHERE captured_at IS NOT NULL"
+            " ORDER BY captured_at"
+        )
+        return [
+            PhotoRecord(
+                photo_id=row[0],
+                captured_at=row[1],
+                lat=float(row[2]) if row[2] is not None else None,
+                lng=float(row[3]) if row[3] is not None else None,
+                place_name=row[4],
+            )
+            for row in cur.fetchall()
+        ]
+
+
+def create_event_category(
+    conn: psycopg.Connection,
+    name: str,
+    color: str,
+) -> tuple[str, bool]:
+    """Create a trip category row if one with this name does not exist yet.
+
+    Args:
+        conn:  psycopg3 connection.
+        name:  Category name (e.g. 'Trip · Sopot · 2026-05').
+        color: Hex color string (e.g. '#1E88E5').
+
+    Returns:
+        (category_id, created) — created=False when the category already existed.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM categories WHERE lower(name) = lower(%s)",
+            (name,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0], False
+
+        cat_id = f"cat-{uuid.uuid4()}"
+        cur.execute(
+            "INSERT INTO categories (id, name, color_hex, auto_enabled, rolled_out)"
+            " VALUES (%s, %s, %s, true, true)",
+            (cat_id, name, color),
+        )
+        return cat_id, True
+
+
 def fetch_unclustered_faces(conn: psycopg.Connection) -> list[tuple[str, float]]:
     """Returns (face_id, det_score) for all faces not yet assigned to a cluster.
 

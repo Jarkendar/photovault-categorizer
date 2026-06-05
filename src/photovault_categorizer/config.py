@@ -63,6 +63,13 @@ class Config:
     face_det_thresh: float
     face_min_px: int
     face_match_threshold: float
+    # Phase 3 — event detection
+    home_lat: float | None
+    home_lng: float | None
+    home_radius_km: float
+    event_gap_hours: float
+    event_min_days: int
+    event_min_photos: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -71,6 +78,9 @@ class Config:
         if raw_url.startswith("jdbc:"):
             raw_url = raw_url[5:]
         parsed = urlparse(raw_url)
+
+        home_lat_raw = os.environ.get("HOME_LAT")
+        home_lng_raw = os.environ.get("HOME_LNG")
 
         return cls(
             db_host=parsed.hostname or "localhost",
@@ -90,4 +100,10 @@ class Config:
             face_match_threshold=float(
                 os.environ.get("FACE_MATCH_THRESHOLD", str(FACE_MATCH_THRESHOLD))
             ),
+            home_lat=float(home_lat_raw) if home_lat_raw is not None else None,
+            home_lng=float(home_lng_raw) if home_lng_raw is not None else None,
+            home_radius_km=float(os.environ.get("HOME_RADIUS_KM", "25.0")),
+            event_gap_hours=float(os.environ.get("EVENT_GAP_HOURS", "6.0")),
+            event_min_days=int(os.environ.get("EVENT_MIN_DAYS", "2")),
+            event_min_photos=int(os.environ.get("EVENT_MIN_PHOTOS", "10")),
         )

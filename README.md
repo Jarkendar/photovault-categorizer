@@ -275,17 +275,47 @@ python -m photovault_categorizer.cli.categorize
 
 ---
 
-## Phase 3 — Events (planned)
+## Phase 3 — Events
 
-Pure heuristic clustering over `captured_at` + `lat`/`lng` — no model, no network call.
+Pure heuristic trip detection — no model, no network call. Groups photos by time, filters by
+distance from home and duration, then creates `auto_enabled` categories and writes
+`source = auto` assignments directly (no CLIP prompts involved).
 
-Vacation heuristic (to tune):
-- Away from home: lat/lng centroid outside a configurable home radius.
-- Multi-day: cluster spans ≥ 2 calendar days.
-- Minimum photos: ≥ 10 photos in the cluster.
+### Scripts
 
-Outputs proposed categories (`"Trip · {place_name} · {year-month}"`) with `rolled_out = false`;
-`add_label.py` then backfills the assignments.
+#### `detect_events.py` — trip detection (on-demand) ✅
+
+```bash
+python -m photovault_categorizer.cli.detect_events
+```
+
+Detects vacation sessions in the library and creates one category per trip.
+
+Algorithm:
+1. Fetch all photos with `captured_at` set (GPS optional but needed for the heuristic).
+2. Sort by `captured_at`, split into sessions on gaps > `EVENT_GAP_HOURS`.
+3. For each session check all three heuristic conditions:
+   - GPS centroid is more than `HOME_RADIUS_KM` from home (`HOME_LAT`/`HOME_LNG` required)
+   - Session spans at least `EVENT_MIN_DAYS` distinct calendar days
+   - Session contains at least `EVENT_MIN_PHOTOS` photos
+4. Passing sessions get a category named `Trip · {place} · {year-month}` (most common
+   `place_name` in the session, falls back to year-month if no GPS place names).
+5. Category is created with `auto_enabled = true`, `rolled_out = true` (idempotent by name).
+6. All photos in the session get a `source = auto` `photo_categories` row (respects
+   `manual`/`denied` precedence — same as every other categoriser write).
+
+Run on-demand from the PC. Re-running is safe — existing categories are found by name and not duplicated.
+
+### Event pipeline knobs (tune and document values in `config.py`)
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HOME_LAT` | _(required)_ | Home latitude — script refuses to run without it |
+| `HOME_LNG` | _(required)_ | Home longitude |
+| `HOME_RADIUS_KM` | `25.0` | Sessions whose GPS centroid is closer than this are treated as "at home" |
+| `EVENT_GAP_HOURS` | `6.0` | Gap between consecutive photos that starts a new session |
+| `EVENT_MIN_DAYS` | `2` | Minimum distinct calendar days a session must span |
+| `EVENT_MIN_PHOTOS` | `10` | Minimum photos in a session |
 
 ---
 
@@ -309,6 +339,12 @@ All configuration via environment variables. Copy `.env.example` to `.env` and f
 | `FACE_DET_THRESH` | `0.5` | Detector confidence floor (Phase 2) |
 | `FACE_MIN_PX` | `40` | Minimum face size in pixels (Phase 2) |
 | `FACE_MATCH_THRESHOLD` | `0.5` | Identity matching cosine threshold (Phase 2) |
+| `HOME_LAT` | _(required for Phase 3)_ | Home latitude in decimal degrees |
+| `HOME_LNG` | _(required for Phase 3)_ | Home longitude in decimal degrees |
+| `HOME_RADIUS_KM` | `25.0` | Home radius — sessions closer than this are not proposed as trips (Phase 3) |
+| `EVENT_GAP_HOURS` | `6.0` | Gap in hours that starts a new temporal session (Phase 3) |
+| `EVENT_MIN_DAYS` | `2` | Minimum calendar days a session must span (Phase 3) |
+| `EVENT_MIN_PHOTOS` | `10` | Minimum photos in a session (Phase 3) |
 
 ---
 

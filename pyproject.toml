@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photovault-categorizer"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "open_clip_torch>=2.24.0",
+    "torch>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "PyYAML>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

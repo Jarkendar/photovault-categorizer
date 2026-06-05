@@ -1,0 +1,10 @@
+# Core runtime
+open_clip_torch>=2.24.0
+torch>=2.0.0
+psycopg[binary]>=3.1.0
+Pillow>=10.0.0
+numpy>=1.26.0
+PyYAML>=6.0.0
+
+# Development / testing
+pytest>=8.0.0

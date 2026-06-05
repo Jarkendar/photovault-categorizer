@@ -1,0 +1,88 @@
+# PL->EN prompt mapping for the CLIP text encoder.
+#
+# Key   = exact tag name or category name as it appears in the database.
+# Value = list of English terms fed to the CLIP text encoder.
+#         Each term is expanded via the template: "a photo of {term}".
+#         Multiple terms are averaged into a single prototype vector.
+#
+# Only tags/categories with auto_enabled=true AND an entry here are scored.
+# Missing entry → label is skipped with a WARNING in the logs.
+# Build this incrementally: add a new entry whenever you create a new auto-enabled label.
+
+# Tags (prefixed with #)
+"#morze":
+  - sea
+  - ocean
+  - seashore
+  - beach
+
+"#rower":
+  - bicycle
+  - bike
+  - cycling
+
+"#las":
+  - forest
+  - woods
+  - trees
+
+"#góry":
+  - mountains
+  - mountain landscape
+  - alpine scenery
+
+"#miasto":
+  - city
+  - urban street
+  - cityscape
+
+"#jedzenie":
+  - food
+  - meal
+  - dish
+
+"#zwierzęta":
+  - animal
+  - pet
+  - wildlife
+
+"#zachód słońca":
+  - sunset
+  - sunrise
+  - golden hour
+
+"#śnieg":
+  - snow
+  - winter landscape
+  - snowy scenery
+
+"#portret":
+  - portrait
+  - person
+  - face
+
+# Categories (not prefixed)
+"Podróże":
+  - travel
+  - vacation
+  - holiday trip
+
+"Przyroda":
+  - nature
+  - landscape
+  - outdoor scenery
+
+"Architektura":
+  - architecture
+  - building
+  - historical building
+
+"Rodzina":
+  - family
+  - family gathering
+  - people together
+
+"Sport":
+  - sport
+  - sports activity
+  - athletic activity

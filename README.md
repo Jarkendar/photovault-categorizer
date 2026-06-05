@@ -2,10 +2,41 @@
 
 Local, ephemeral ML job that automatically tags and categorizes photos stored in
 [PhotoVault](https://github.com/Jarkendar/photovault-server). Uses a frozen CLIP embedder
-plus a lightweight zero-shot / k-NN classifier so adding a new label means re-scoring
-cached embeddings — not retraining a network.
+plus a lightweight zero-shot classifier — adding a new label means re-scoring
+cached embeddings, not retraining a network.
 
 Runs as `docker run --rm` — nothing stays alive between runs.
+
+---
+
+## Implementation status
+
+| Iteration | Scope | Status |
+|---|---|---|
+| **1** | Scaffold, nightly `categorize.py`, unit tests | ✅ done |
+| **2** | `bulk_embed.py`, `add_label.py`, self-heal, systemd timer | ☐ planned |
+
+### Iteration 2 — what needs to be built
+
+- **`cli/bulk_embed.py`** — one-shot full-library embed for a large initial backlog.
+  Queries `photos WHERE embedded_at IS NULL OR embedding_model <> ?`, downloads `medium.jpg`,
+  encodes in batches, writes vectors to store, updates `photos.embedded_at` + `embedding_model`.
+  Runs on RTX for speed; same code works on Pi (just slower). Not needed when the library
+  grows organically from zero through the app.
+
+- **`cli/add_label.py <label-id>`** — backfill a single newly created label without
+  re-embedding any photos. Sets `rolled_out = false`, loads the existing `.npz` store,
+  scores every photo vector against the new label's text prototype, writes `source = auto`
+  rows (respects `denied` tombstones), then sets `rolled_out = true`.
+
+- **Self-heal in `categorize.py`** — at the start of each nightly run, check whether any
+  photo in the DB is missing from the `.npz` store (deleted and re-uploaded, or store was
+  reset). Re-embed those photos before scoring. Currently the nightly job only processes
+  the `pending_categorization` delta.
+
+- **`deploy/photovault-categorizer.service`** + **`deploy/photovault-categorizer.timer`** —
+  systemd unit + timer that fires `docker run --rm photovault-categorizer` daily at ~03:00
+  on the Pi. Also document the n8n flow alternative.
 
 ---
 
@@ -13,11 +44,16 @@ Runs as `docker run --rm` — nothing stays alive between runs.
 
 | Machine | Role | When |
 |---|---|---|
-| PC (RTX 2070 Super, 8 GB VRAM) | Bulk CLIP embedding; new-label backfill | On-demand (interactive) |
-| Pi 5 (8 GB RAM) | Nightly oneshot — embed delta → score → write → exit | Scheduled (systemd timer) |
+| Pi 5 (8 GB RAM) | Nightly oneshot — embed delta → score → write → exit | Automated (systemd timer) |
+| PC (RTX 2070 Super) | Optional one-time bulk embed of a large backlog | On-demand only |
 
 Both machines connect to the same PostgreSQL instance via **Tailscale**.
 A lock file (`/tmp/photovault-categorize.lock`) prevents concurrent runs.
+
+`categorize.py` and `add_label.py` run fully on Pi — they only encode text prompts
+(cheap) and score cached image vectors (fast matmul). Image encoding on Pi is ~0.5 s/photo
+which is fine for the nightly delta of a few dozen photos.
+The RTX only matters if you have a large existing photo library to embed all at once.
 
 ---
 
@@ -27,9 +63,9 @@ A lock file (`/tmp/photovault-categorize.lock`) prevents concurrent runs.
 
 | Phase | Signal | Technique |
 |---|---|---|
-| 1 | Visual appearance | CLIP embeddings + zero-shot classification / k-NN |
-| 2 | People / identity | Face detection + ArcFace embeddings + clustering |
-| 3 | Events / trips | Temporal + geographic heuristic clustering |
+| 1 | Visual appearance | CLIP embeddings + zero-shot classification |
+| 2 | People / identity | Face detection + ArcFace embeddings + clustering (planned) |
+| 3 | Events / trips | Temporal + geographic heuristic clustering (planned) |
 
 ### Assignment model
 
@@ -43,7 +79,7 @@ Precedence: manual > denied > auto
 
 - This job only writes `source = auto` rows.
 - Pairs with an existing `manual` or `denied` row are never touched.
-- `denied` tombstones (user explicitly unlinked) act as hard negatives — the job skips them permanently.
+- `denied` tombstones (user explicitly unlinked) act as hard negatives — permanently skipped.
 - Re-scoring updates `score` on existing `auto` rows only.
 
 Each tag and category also has two control flags:
@@ -53,7 +89,7 @@ Each tag and category also has two control flags:
 | `auto_enabled` | `false` | May the bot assign this label automatically? |
 | `rolled_out` | `true` | `false` = new label awaiting full library backfill |
 
-The nightly job only works on labels where `auto_enabled = true`.
+The nightly job only works on labels where `auto_enabled = true` **and** `rolled_out = true`.
 
 ---
 
@@ -61,16 +97,21 @@ The nightly job only works on labels where `auto_enabled = true`.
 
 ### Embedder
 
-- **Model:** MobileCLIP-S2 exported to ONNX (~20 MB)
-- **Preprocessing:** `center_crop(224)`, `normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])`, `float32`
-- Same model on both PC and Pi — identical graph, preprocessing, and floating-point precision — required for a shared vector space.
+- **Model:** MobileCLIP-S2 via `open_clip_torch`, pretrained weights `datacompdr`, **fp32**
+- **Device:** `cuda` if available, otherwise `cpu` — same code runs on RTX (fast tests) and Pi (nightly automat)
+- **Preprocessing:** inference transform bundled with `open_clip` (center-crop 224 + normalise, no augmentation)
+- **Model id** (stored in DB + vector store filename): `mobileclip-s2-datacompdr`
+
+ONNX export is deferred as a future optimisation. If Pi turns out to be too slow for the
+nightly delta, exporting to ONNX fp32 is a drop-in swap — the vector space is identical.
 
 ### Vector store
 
-- **Format:** `hnswlib` index file, keyed by `photo-<uuid>` string IDs.
-- One index file per model version (filename carries model id). Bumping the model = full re-embed pass.
-- Stored on a shared volume (or `rsync`-ed PC↔Pi over Tailscale before the nightly run).
-- Nightly job self-heals: re-embeds any photo missing from the store; prunes vectors for photo ids that no longer exist in Postgres.
+- **Format:** NumPy `.npz` file — `ids: object[N]`, `vectors: float32[N, D]`
+- **Location:** `{VECTOR_STORE_DIR}/mobileclip-s2-datacompdr.npz`
+- One file per model id. Bumping the model = full re-embed pass.
+- Scoring is a dense matmul over all photo vectors — no ANN index needed at this scale
+  (~2 KB/photo → 100 MB for 50 k photos).
 
 ### PL→EN prompt mapping
 
@@ -87,59 +128,65 @@ Polish tag/category names are mapped to English prompt strings via a static `pro
   - cycling
 ```
 
-The CLIP text encoder receives the English prompts. Tags/categories without a mapping entry are skipped by the classifier — the mapping is built incrementally, add a new entry when you create a new tag/category with `auto_enabled = true`.
+The CLIP text encoder receives the English prompts wrapped in the template
+`"a photo of {term}"`. Multiple terms per label are encoded separately and
+averaged into a single normalised prototype vector.
 
-Prompt template: `"a photo of {label}"`.
+Tags/categories without a mapping entry are **skipped** with a `WARNING` log line —
+that is the signal to add the entry. Build the file incrementally: add a new entry
+whenever you create a new tag/category with `auto_enabled = true`.
 
 ### Scripts
 
-#### `bulk_embed.py` (RTX PC — on-demand)
+#### `categorize.py` — nightly Pi run ✅
 
-```
-python bulk_embed.py
-```
-
-1. Connects to Postgres over Tailscale.
-2. Fetches all photos where `embedded_at IS NULL` or `embedded_at < model_updated_at`.
-3. Downloads `medium.jpg` from the storage root.
-4. Computes CLIP embeddings in batches (batch size tuned to 8 GB VRAM).
-5. Writes embeddings to the hnswlib index.
-6. Updates `photos.embedded_at` and `photos.embedding_model`.
-
-#### `add_label.py` (RTX PC — on-demand, after creating a new tag/category)
-
-```
-python add_label.py <category-or-tag-id>
+```bash
+python -m photovault_categorizer.cli.categorize
 ```
 
-1. Sets `rolled_out = false` on the target label.
-2. Runs a full library scoring pass (zero-shot or k-NN) for that single label.
-3. Inserts `source = auto` rows where no row exists; respects `denied` tombstones.
-4. Sets `rolled_out = true`.
+1. Acquires exclusive lock (`/tmp/photovault-categorize.lock`); exits 0 if already held.
+2. **Delta queue:** `SELECT id, medium_path FROM photos WHERE processing_status = 'pending_categorization'`.
+3. Loads MobileCLIP-S2 + `.npz` store + text prototypes (once per run).
+4. For each photo: embed `medium.jpg` → score against all auto-enabled prototypes →
+   write `source = auto` junction rows → flip `processing_status` to `'ready'`,
+   all in one transaction.
+5. Prunes orphan vectors (deleted photos) from the store; saves.
+6. Logs: `photos processed: N, tags inserted: M, categories inserted: K, denied skipped: D`.
 
-#### `categorize.py` (Pi — nightly)
+#### `bulk_embed.py` — optional one-time backfill ☐ (Iteration 2)
 
-1. Acquires lock file; exits 0 if already locked.
-2. **Delta queue:** `SELECT id FROM photos WHERE processing_status = 'pending_categorization'`
-3. Downloads + embeds delta photos; writes to store; updates `photos.embedded_at`.
-4. Scores each photo against all tags/categories where `auto_enabled = true` and `rolled_out = true`.
-5. Inserts `source = auto` junction rows (respects precedence — skips `manual`/`denied` pairs).
-6. Flips `photos.processing_status` from `pending_categorization` → `ready` in the same transaction.
-7. Logs summary: `photos processed: N, tags inserted: M, categories inserted: K, denied skipped: D`.
-8. Releases lock file; exits 0.
+```bash
+python -m photovault_categorizer.cli.bulk_embed
+```
 
-### Scoring strategy (to tune)
+Embeds all photos missing from the vector store or embedded with an older model.
+Use when you have a large existing backlog. Runs on Pi too, just slower (~0.5 s/photo CPU).
 
-- **Tags** — multi-label: insert `auto` row if `score >= 0.25` (threshold-based).
-- **Categories** — top-1/2: pick the highest-scoring `auto_enabled` category/categories.
+#### `add_label.py` — new-label backfill ☐ (Iteration 2)
 
-These thresholds are open knobs — document final values here once tuned.
+```bash
+python -m photovault_categorizer.cli.add_label <tag-or-category-id>
+```
+
+Backfills a single newly created label without touching image embeddings:
+re-scores all cached vectors, writes `auto` rows, flips `rolled_out = true`.
+
+### Scoring knobs (to tune)
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `TAG_THRESHOLD` | `0.25` | Minimum cosine similarity for a tag to be assigned |
+| `CATEGORY_TOP_K` | `1` | Maximum number of categories to assign per photo |
+| `CATEGORY_MIN_SCORE` | `0.0` | Minimum score a category must reach to be assigned |
+
+Document final values here once tuned against real photos.
 
 ---
 
 ## Phase 2 — People (planned)
 
-Dedicated face detection + recognition pipeline with a **separate** vector store (face embeddings live in a different space than CLIP scene embeddings).
+Dedicated face detection + recognition pipeline with a **separate** vector store
+(face embeddings live in a different space than CLIP scene embeddings).
 
 - Face model: InsightFace / ArcFace ONNX (lightweight enough for Pi inference).
 - Separate `faces.hnsw` store keyed by `face-<uuid>` → `photo-<uuid>` + bounding box.
@@ -164,44 +211,59 @@ Outputs proposed categories (`"Trip · {place_name} · {year-month}"`) with `rol
 
 ## Configuration
 
-All configuration via environment variables (same `.env` / Docker secrets as the PhotoVault server):
+All configuration via environment variables. Copy `.env.example` to `.env` and fill in the values.
 
-| Variable | Description |
-|---|---|
-| `DB_URL` | PostgreSQL psycopg2 DSN |
-| `DB_USER` | Database user |
-| `DB_PASSWORD` | Database password |
-| `PHOTO_STORAGE_ROOT` | Root path where `medium.jpg` files are stored |
-| `VECTOR_STORE_PATH` | Path to the hnswlib index file |
-| `HOME_LAT` | Home latitude (Phase 3) |
-| `HOME_LNG` | Home longitude (Phase 3) |
-| `HOME_RADIUS_KM` | Home radius in km (Phase 3, default: 50) |
+| Variable | Default | Description |
+|---|---|---|
+| `DB_URL` | `jdbc:postgresql://localhost:5432/photovault` | PostgreSQL URL — JDBC or plain psycopg3 format |
+| `DB_USER` | `photovault` | Database user |
+| `DB_PASSWORD` | _(empty)_ | Database password |
+| `PHOTO_STORAGE_ROOT` | `./data/photos` | Root path where `medium.jpg` files are stored |
+| `VECTOR_STORE_DIR` | `./data/vectors` | Directory for `.npz` vector store files |
+| `PROMPTS_PATH` | `prompts.yaml` | Path to the PL→EN prompt mapping file |
+| `TAG_THRESHOLD` | `0.25` | Cosine similarity floor for tag assignment |
+| `CATEGORY_TOP_K` | `1` | Max categories assigned per photo |
+| `CATEGORY_MIN_SCORE` | `0.0` | Minimum score for any category assignment |
 
 ---
 
 ## Running
 
 ```bash
-# Nightly Pi run
+# Nightly Pi run (Docker)
 docker run --rm \
   --env-file .env \
   -v /path/to/photos:/photos:ro \
   -v /path/to/vectors:/vectors \
   photovault-categorizer
 
-# On-demand bulk embed (PC)
-docker run --rm \
-  --env-file .env \
-  -v /path/to/photos:/photos:ro \
-  -v /path/to/vectors:/vectors \
-  photovault-categorizer python bulk_embed.py
+# Local run for testing (venv, uses CUDA if available)
+python -m photovault_categorizer.cli.categorize
 
-# Backfill a new label (PC)
-docker run --rm \
-  --env-file .env \
-  -v /path/to/photos:/photos:ro \
-  -v /path/to/vectors:/vectors \
-  photovault-categorizer python add_label.py cat-<uuid>
+# Iteration 2 — one-time bulk embed
+docker run --rm --env-file .env \
+  -v /path/to/photos:/photos:ro -v /path/to/vectors:/vectors \
+  photovault-categorizer python -m photovault_categorizer.cli.bulk_embed
+
+# Iteration 2 — backfill a new label
+docker run --rm --env-file .env \
+  -v /path/to/photos:/photos:ro -v /path/to/vectors:/vectors \
+  photovault-categorizer python -m photovault_categorizer.cli.add_label tag-<uuid>
+```
+
+### Local development setup
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip setuptools
+.venv/bin/pip install torch          # add --index-url .../cu121 for CUDA
+.venv/bin/pip install -e ".[dev]"
+
+# Unit tests (no DB required)
+.venv/bin/pytest tests/ --ignore=tests/test_write_precedence.py
+
+# Integration tests (requires running Postgres matching DB_URL)
+.venv/bin/pytest tests/test_write_precedence.py
 ```
 
 ---

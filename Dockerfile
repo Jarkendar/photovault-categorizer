@@ -37,14 +37,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch first (avoids pulling a CUDA variant from PyPI default index)
+# Install CPU-only PyTorch + torchvision from the CPU wheel index.
+# Both must come from the same index — mixing PyPI torchvision with a +cpu torch
+# causes a RuntimeError at import ("operator torchvision::nms does not exist").
 RUN pip install --no-cache-dir \
-        torch \
+        torch torchvision \
         --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining dependencies (skip torch line to avoid a second download)
+# Install remaining dependencies, skipping torch/torchvision to avoid
+# a second download from PyPI that would overwrite the CPU wheels above.
 COPY requirements.txt .
-RUN grep -v '^torch' requirements.txt > requirements_no_torch.txt \
+RUN grep -vE '^torch(vision)?' requirements.txt > requirements_no_torch.txt \
     && pip install --no-cache-dir -r requirements_no_torch.txt \
     && rm requirements_no_torch.txt
 
